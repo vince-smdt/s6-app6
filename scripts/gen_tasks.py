@@ -23,3 +23,7 @@ for f in files:
         os.path.join(dirname, f),
         os.path.join(out_dirname, pngname),
         width))
+    print("%s;%s;%s"%(
+        os.path.join(dirname, f),
+        os.path.join("COPY_" + out_dirname, pngname),
+        width))

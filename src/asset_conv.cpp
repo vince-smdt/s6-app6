@@ -22,6 +22,8 @@ const int NUM_THREADS = 1;    // Default value, changed by argv.
 
 using PNGDataVec = std::vector<char>;
 using PNGDataPtr = std::shared_ptr<PNGDataVec>;
+using PNGHashMap =
+    std::unordered_map<std::string, std::unordered_map<int, PNGDataPtr>>;
 
 /// \brief Wraps callbacks from stbi_image_write
 //
@@ -97,9 +99,12 @@ struct TaskDef {
 class TaskRunner {
 private:
   TaskDef task_def_;
+  PNGHashMap &hashmap_;
+  std::mutex &hash_mtx_;
 
 public:
-  TaskRunner(const TaskDef &task_def) : task_def_(task_def) {}
+  TaskRunner(const TaskDef &task_def, PNGHashMap &hashmap, std::mutex &hash_mtx)
+      : task_def_(task_def), hashmap_(hashmap), hash_mtx_(hash_mtx) {}
 
   void operator()() {
     const std::string &fname_in = task_def_.fname_in;
@@ -116,26 +121,49 @@ public:
     NSVGrasterizer *rast = nullptr;
 
     try {
-      // Read the file ...
-      image_in = nsvgParseFromFile(fname_in.c_str(), "px", 0);
-      if (image_in == nullptr) {
-        std::string msg = "Cannot parse '" + fname_in + "'.";
-        throw std::runtime_error(msg.c_str());
+      PNGDataPtr data = nullptr;
+
+      {
+        std::lock_guard<std::mutex> lock(hash_mtx_);
+        auto outer = hashmap_.find(fname_in);
+        if (outer != hashmap_.end()) {
+          auto inner = outer->second.find(task_def_.size);
+          if (inner != outer->second.end())
+            data = inner->second;
+        }
       }
 
-      // Raster it ...
-      std::vector<unsigned char> image_data(image_size, 0);
-      rast = nsvgCreateRasterizer();
-      nsvgRasterize(rast, image_in, 0, 0, scale, &image_data[0], width, height,
-                    stride);
+      if (!data) {
+        // Read the file ...
+        image_in = nsvgParseFromFile(fname_in.c_str(), "px", 0);
+        if (image_in == nullptr) {
+          std::string msg = "Cannot parse '" + fname_in + "'.";
+          throw std::runtime_error(msg.c_str());
+        }
 
-      // Compress it ...
-      PNGWriter writer;
-      writer(width, height, BPP, &image_data[0], stride);
+        // Raster it ...
+        std::vector<unsigned char> image_data(image_size, 0);
+        rast = nsvgCreateRasterizer();
+        nsvgRasterize(rast, image_in, 0, 0, scale, &image_data[0], width,
+                      height, stride);
+
+        // Compress it ...
+        PNGWriter writer;
+        writer(width, height, BPP, &image_data[0], stride);
+        data = writer.getData();
+        {
+          std::lock_guard<std::mutex> lock(hash_mtx_);
+          hashmap_[task_def_.fname_in][task_def_.size] = data;
+          // std::cout << "Cache fill: " << task_def_.fname_in << ", "
+          //           << task_def_.size << std::endl;
+        }
+      } else {
+        // std::cout << "Cache hit: " << task_def_.fname_in << ", "
+        //           << task_def_.size << std::endl;
+      }
 
       // Write it out ...
       std::ofstream file_out(fname_out, std::ofstream::binary);
-      auto data = writer.getData();
       file_out.write(&(data->front()), data->size());
 
     } catch (std::runtime_error e) {
@@ -170,12 +198,10 @@ class Processor {
 private:
   // The tasks to run queue (FIFO).
   std::queue<TaskDef> task_queue_;
-  std::mutex mtx_;
+  std::mutex queue_mtx_;
 
-  // The cache hash map (TODO). Note that we use the string definition as the //
-  // key.
-  using PNGHashMap = std::unordered_map<std::string, PNGDataPtr>;
   PNGHashMap png_cache_;
+  std::mutex hash_mtx_;
 
   bool should_run_; // Used to signal the end of the processor to
                     // threads.
@@ -245,7 +271,7 @@ public:
   void parseAndRun(const std::string &line_org) {
     TaskDef def;
     if (parse(line_org, def)) {
-      TaskRunner runner(def);
+      TaskRunner runner(def, png_cache_, hash_mtx_);
       runner();
     }
   }
@@ -259,14 +285,14 @@ public:
     TaskDef def;
     if (parse(line_org, def)) {
       std::cerr << "Queueing task '" << line_org << "'." << std::endl;
-      std::lock_guard<std::mutex> lock(mtx_);
+      std::lock_guard<std::mutex> lock(queue_mtx_);
       task_queue_.push(def);
     }
   }
 
   /// \brief Returns if the internal queue is empty (true) or not.
   bool queueEmpty() {
-    std::lock_guard<std::mutex> lock(mtx_);
+    std::lock_guard<std::mutex> lock(queue_mtx_);
     return task_queue_.empty();
   }
 
@@ -277,7 +303,7 @@ private:
 
     while (should_run_) {
       {
-        std::lock_guard<std::mutex> lock(mtx_);
+        std::lock_guard<std::mutex> lock(queue_mtx_);
 
         if (!task_queue_.empty()) {
           task_def = task_queue_.front();
@@ -287,7 +313,7 @@ private:
         }
       }
 
-      TaskRunner runner(task_def);
+      TaskRunner runner(task_def, png_cache_, hash_mtx_);
       runner();
     }
   }
