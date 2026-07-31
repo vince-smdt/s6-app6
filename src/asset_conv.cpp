@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
@@ -169,6 +170,7 @@ class Processor {
 private:
   // The tasks to run queue (FIFO).
   std::queue<TaskDef> task_queue_;
+  std::mutex mtx_;
 
   // The cache hash map (TODO). Note that we use the string definition as the //
   // key.
@@ -257,23 +259,36 @@ public:
     TaskDef def;
     if (parse(line_org, def)) {
       std::cerr << "Queueing task '" << line_org << "'." << std::endl;
+      std::lock_guard<std::mutex> lock(mtx_);
       task_queue_.push(def);
     }
   }
 
   /// \brief Returns if the internal queue is empty (true) or not.
-  bool queueEmpty() { return task_queue_.empty(); }
+  bool queueEmpty() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return task_queue_.empty();
+  }
 
 private:
   /// \brief Queue processing thread function.
   void processQueue() {
+    TaskDef task_def;
+
     while (should_run_) {
-      if (!task_queue_.empty()) {
-        TaskDef task_def = task_queue_.front();
-        task_queue_.pop();
-        TaskRunner runner(task_def);
-        runner();
+      {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        if (!task_queue_.empty()) {
+          task_def = task_queue_.front();
+          task_queue_.pop();
+        } else {
+          continue;
+        }
       }
+
+      TaskRunner runner(task_def);
+      runner();
     }
   }
 };
@@ -316,9 +331,8 @@ int main(int argc, char **argv) {
   if (argc >= 3) {
     num_threads = parseNumThreads(argv[2]);
   }
-  std::cout << "Number of threads used: " << num_threads << std::endl;
+  std::cerr << "Number of threads used: " << num_threads << std::endl;
 
-  // TODO: change the number of threads from args.
   Processor proc(num_threads);
 
   while (!std::cin.eof()) {
