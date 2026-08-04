@@ -5,15 +5,17 @@ import os
 import subprocess
 import sys
 
-NUM_PROCESSES = 2
+NUM_PROCESSES = 4
 
 def run_process(task_desc):
-    p = subprocess.Popen(["./asset_conv"], stdin=subprocess.PIPE)
+    print("Running process...")
+    p = subprocess.Popen(["./asset_conv", "-", "4"], stdin=subprocess.PIPE)
     p.communicate(input=task_desc.encode())
 
 
 
 if __name__ == "__main__":
+    print(f"Number of processes: {NUM_PROCESSES}")
     pool = Pool(NUM_PROCESSES)
 
     queues = [ [] for i in range(NUM_PROCESSES) ]
@@ -28,6 +30,4 @@ if __name__ == "__main__":
         task_descs.append(task_desc)
 
     pool.map(run_process, task_descs)
-    
-
 

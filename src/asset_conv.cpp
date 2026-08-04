@@ -3,6 +3,8 @@
 #include "nanosvg/nanosvg.h"
 #include "nanosvg/nanosvgrast.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -199,12 +201,15 @@ private:
   // The tasks to run queue (FIFO).
   std::queue<TaskDef> task_queue_;
   std::mutex queue_mtx_;
+  std::condition_variable queue_cv_;
+  std::condition_variable empty_cv_;
+  int active_tasks_ = 0;
 
   PNGHashMap png_cache_;
   std::mutex hash_mtx_;
 
-  bool should_run_; // Used to signal the end of the processor to
-                    // threads.
+  std::atomic<bool> should_run_; // Used to signal the end of the processor
+                                 // to threads.
 
   std::vector<std::thread> queue_threads_;
 
@@ -229,6 +234,7 @@ public:
 
   ~Processor() {
     should_run_ = false;
+    queue_cv_.notify_all();
     for (auto &qthread : queue_threads_) {
       qthread.join();
     }
@@ -285,8 +291,11 @@ public:
     TaskDef def;
     if (parse(line_org, def)) {
       std::cerr << "Queueing task '" << line_org << "'." << std::endl;
-      std::lock_guard<std::mutex> lock(queue_mtx_);
-      task_queue_.push(def);
+      {
+        std::lock_guard<std::mutex> lock(queue_mtx_);
+        task_queue_.push(def);
+      }
+      queue_cv_.notify_one();
     }
   }
 
@@ -296,25 +305,48 @@ public:
     return task_queue_.empty();
   }
 
+  /// \brief Blocks until the internal queue is empty and every popped task
+  ///        has finished processing.
+  ///
+  /// Unlike busy-waiting on queueEmpty(), this parks the calling thread on
+  /// a condition variable so it consumes no CPU while waiting.
+  void waitUntilEmpty() {
+    std::unique_lock<std::mutex> lock(queue_mtx_);
+    empty_cv_.wait(
+        lock, [this] { return task_queue_.empty() && active_tasks_ == 0; });
+  }
+
 private:
   /// \brief Queue processing thread function.
   void processQueue() {
-    TaskDef task_def;
-
     while (should_run_) {
+      TaskDef task_def;
       {
-        std::lock_guard<std::mutex> lock(queue_mtx_);
+        std::unique_lock<std::mutex> lock(queue_mtx_);
 
-        if (!task_queue_.empty()) {
-          task_def = task_queue_.front();
-          task_queue_.pop();
-        } else {
+        queue_cv_.wait(lock,
+                       [this] { return !task_queue_.empty() || !should_run_; });
+
+        if (task_queue_.empty()) {
+          // Only reachable if should_run_ has become false.
           continue;
         }
+
+        task_def = task_queue_.front();
+        task_queue_.pop();
+        ++active_tasks_;
       }
 
       TaskRunner runner(task_def, png_cache_, hash_mtx_);
       runner();
+
+      {
+        std::lock_guard<std::mutex> lock(queue_mtx_);
+        --active_tasks_;
+        if (task_queue_.empty() && active_tasks_ == 0) {
+          empty_cv_.notify_all();
+        }
+      }
     }
   }
 };
@@ -375,7 +407,6 @@ int main(int argc, char **argv) {
     file_in.close();
   }
 
-  // Wait until the processor queue's has tasks to do.
-  while (!proc.queueEmpty()) {
-  };
+  // Wait until the processor's queue has been drained.
+  proc.waitUntilEmpty();
 }
